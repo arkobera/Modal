@@ -1,118 +1,296 @@
-import pathlib
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
+import os
+import joblib
+import modal
 
-import modal #type: ignore
+app = modal.App("math-misconception-qwen")
 
-app = modal.App("example-unsloth-finetune")
-
-train_image = (
+image = (
     modal.Image.debian_slim(python_version="3.11")
-    .uv_pip_install(
-        "accelerate==1.9.0",
-        "datasets==3.6.0",
-        "hf-transfer==0.1.9",
-        "huggingface_hub==0.34.2",
-        "peft==0.16.0",
-        "transformers==4.54.0",
-        "trl==0.19.1",
-        "unsloth[cu128-torch270]==2025.7.8",
-        "unsloth_zoo==2025.7.10",
-        "wandb==0.21.0",
+    .pip_install(
+        "torch",
+        "transformers",
+        "datasets",
+        "peft",
+        "accelerate",
+        "pandas",
+        "numpy",
+        "scikit-learn",
+        "joblib",
+        "sentencepiece"
     )
-    .env({"HF_READ": "/model_cache"})
 )
 
-with train_image.imports():
-    # unsloth must be first!
-    import unsloth #type: ignore  # noqa: F401,I001
-    import datasets
+volume = modal.Volume.from_name(
+    "dataset",
+    create_if_missing=False
+)
+
+hf_secret = modal.Secret.from_name("hf-secret")
+
+
+@app.function(
+    image=image,
+    gpu="A100-40GB",
+    timeout=60 * 60 * 12,
+    volumes={"/data": volume},
+    secrets=[hf_secret],
+)
+def train():
+
+    import pandas as pd
+    import numpy as np
     import torch
-    import wandb
-    from transformers import TrainingArguments #type: ignore
-    from trl import SFTTrainer #type: ignore
-    from unsloth import FastLanguageModel #type: ignore
-    from unsloth.chat_templates import standardize_sharegpt #type: ignore
 
+    from datasets import load_dataset, Dataset
+    from sklearn.preprocessing import LabelEncoder
 
-model_cache_volume = modal.Volume.from_name(
-    "unsloth-model-cache", create_if_missing=True
-)
-dataset_cache_volume = modal.Volume.from_name(
-    "unsloth-dataset-cache", create_if_missing=True
-)
-checkpoint_volume = modal.Volume.from_name(
-    "unsloth-checkpoints", create_if_missing=True
-)
+    from transformers import (
+        AutoTokenizer,
+        AutoModelForSequenceClassification,
+        TrainingArguments,
+        Trainer,
+        DataCollatorWithPadding,
+    )
 
-GPU_TYPE = "T4"
-TIMEOUT_HOURS = 6
-MAX_RETRIES = 3
+    from peft import (
+        LoraConfig,
+        get_peft_model,
+        prepare_model_for_kbit_training,
+    )
 
-CONVERSATION_COLUMN = "conversations"  # ShareGPT format column name
-TEXT_COLUMN = "text"  # Output column for formatted text
-TRAIN_SPLIT_RATIO = 0.9  # 90% train, 10% eval split
-PREPROCESSING_WORKERS = 2  # Number of workers for dataset processing
+    HF_TOKEN = os.environ["HF_TOKEN"]
 
+    MODEL_NAME = "Qwen/Qwen3-4B-Instruct-2507"
 
-def format_chat_template(examples, tokenizer):
-    texts = []
-    for conversation in examples[CONVERSATION_COLUMN]:
-        formatted_text = tokenizer.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=False
+    CACHE_DIR = "/data/cache"
+    OUTPUT_DIR = "/data/qwen3_4b"
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print("Loading dataset...")
+
+    ds = load_dataset(
+        "guldasta/Math_misconception",
+        token=HF_TOKEN
+    )
+
+    train = ds["train"].to_pandas()
+    train = train.head(500)
+
+    train.Misconception = train.Misconception.fillna("NA")
+
+    train["target"] = (
+        train.Category
+        + ":"
+        + train.Misconception
+    )
+
+    le = LabelEncoder()
+
+    train["label"] = le.fit_transform(
+        train["target"]
+    )
+
+    n_classes = len(le.classes_)
+
+    print("Classes:", n_classes)
+
+    idx = (
+        train.apply(
+            lambda row:
+            row.Category.split("_")[0] == "True",
+            axis=1,
         )
-        texts.append(formatted_text)
-    return {TEXT_COLUMN: texts}
+    )
 
+    correct = train.loc[idx].copy()
 
-def load_or_cache_dataset(config: "TrainingConfig", paths: dict, tokenizer): #type: ignore
-    dataset_cache_path = paths["dataset_cache"]
-
-    if dataset_cache_path.exists():
-        print(f"Loading cached dataset from {dataset_cache_path}")
-        train_dataset = datasets.load_from_disk(dataset_cache_path / "train")
-        eval_dataset = datasets.load_from_disk(dataset_cache_path / "eval")
-    else:
-        print(f"Downloading and processing dataset: {config.dataset_name}")
-
-        # Load and standardize the dataset format
-        dataset = datasets.load_dataset(config.dataset_name, split="train")
-        dataset = standardize_sharegpt(dataset)
-
-        # Split into training and evaluation sets with fixed seed for reproducibility
-        dataset = dataset.train_test_split(
-            test_size=1.0 - TRAIN_SPLIT_RATIO, seed=config.seed
+    correct["c"] = (
+        correct.groupby(
+            ["QuestionId", "MC_Answer"]
         )
-        train_dataset = dataset["train"]
-        eval_dataset = dataset["test"]
+        .MC_Answer.transform("count")
+    )
 
-        # Apply chat template formatting to convert conversations to text
-        print("Formatting datasets with chat template...")
-        train_dataset = train_dataset.map(
-            lambda examples: format_chat_template(examples, tokenizer),
-            batched=True,
-            num_proc=PREPROCESSING_WORKERS,
-            remove_columns=train_dataset.column_names,
+    correct = (
+        correct
+        .sort_values("c", ascending=False)
+        .drop_duplicates(["QuestionId"])
+    )
+
+    correct = correct[
+        ["QuestionId", "MC_Answer"]
+    ]
+
+    correct["is_correct"] = 1
+
+    train = train.merge(
+        correct,
+        on=["QuestionId", "MC_Answer"],
+        how="left",
+    )
+
+    train.is_correct = (
+        train.is_correct.fillna(0)
+    )
+
+    def format_input_v2(row):
+
+        correct_text = (
+            "Yes"
+            if row["is_correct"]
+            else "No"
         )
 
-        eval_dataset = eval_dataset.map(
-            lambda examples: format_chat_template(examples, tokenizer),
-            batched=True,
-            num_proc=PREPROCESSING_WORKERS,
-            remove_columns=eval_dataset.column_names,
+        return (
+            f"Question: {row['QuestionText']}\n"
+            f"Answer: {row['MC_Answer']}\n"
+            f"Is Correct Answer: {correct_text}\n"
+            f"Student Explanation: {row['StudentExplanation']}"
         )
 
-        # Cache the processed datasets for future runs
-        print(f"Caching processed datasets to {dataset_cache_path}")
-        dataset_cache_path.mkdir(parents=True, exist_ok=True)
-        train_dataset.save_to_disk(dataset_cache_path / "train")
-        eval_dataset.save_to_disk(dataset_cache_path / "eval")
+    train["text"] = train.apply(
+        format_input_v2,
+        axis=1,
+    )
 
-        # Commit the dataset cache to the volume
-        dataset_cache_volume.commit()
+    train_df = train[
+        ["text", "label"]
+    ].copy()
 
-    return train_dataset, eval_dataset
+    train_df["label"] = (
+        train_df["label"]
+        .astype(np.int64)
+    )
+
+    train_ds = Dataset.from_pandas(
+        train_df,
+        preserve_index=False,
+    )
+
+    print("Loading model...")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        token=HF_TOKEN,
+        trust_remote_code=True,
+        cache_dir=CACHE_DIR,
+    )
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME,
+        num_labels=n_classes,
+        token=HF_TOKEN,
+        trust_remote_code=True,
+        cache_dir=CACHE_DIR,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+
+    tokenizer.add_special_tokens(
+        {"pad_token": "[PAD]"}
+    )
+
+    model.resize_token_embeddings(
+        len(tokenizer)
+    )
+
+    model.config.pad_token_id = (
+        tokenizer.pad_token_id
+    )
+
+    def tokenize(batch):
+        return tokenizer(
+            batch["text"],
+            truncation=True,
+            max_length=256,
+        )
+
+    train_ds = train_ds.map(
+        tokenize,
+        batched=True,
+        remove_columns=["text"],
+    )
+
+    lora_config = LoraConfig(
+        r=64,
+        lora_alpha=32,
+        lora_dropout=0.3,
+        bias="none",
+        task_type="SEQ_CLS",
+        target_modules=[
+            "q_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+        modules_to_save=["score"],
+    )
+
+    model = prepare_model_for_kbit_training(
+        model
+    )
+
+    model = get_peft_model(
+        model,
+        lora_config,
+    )
+
+    data_collator = DataCollatorWithPadding(
+        tokenizer=tokenizer
+    )
+
+    training_args = TrainingArguments(
+        output_dir=f"{OUTPUT_DIR}/checkpoints",
+        num_train_epochs=3,
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=4,
+        learning_rate=2e-4,
+        warmup_ratio=0.1,
+        lr_scheduler_type="cosine",
+        bf16=True,
+        save_strategy="no",
+        logging_steps=100,
+        report_to="none",
+        gradient_checkpointing=True,
+        dataloader_drop_last=True,
+        remove_unused_columns=False,
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        processing_class=tokenizer,
+        data_collator=data_collator,
+    )
+
+    trainer.train()
+
+    print("Saving model...")
+
+    trainer.save_model(
+        f"{OUTPUT_DIR}/best"
+    )
+
+    tokenizer.save_pretrained(
+        f"{OUTPUT_DIR}/best"
+    )
+
+    joblib.dump(
+        le,
+        f"{OUTPUT_DIR}/label_encoder.joblib",
+    )
+
+    volume.commit()
+
+    print("Training completed.")
+    print("Saved to Modal volume.")
 
 
-
+@app.local_entrypoint()
+def main():
+    train.remote()
