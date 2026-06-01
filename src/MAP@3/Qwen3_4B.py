@@ -1,6 +1,6 @@
 import os
 import joblib
-import modal
+import modal #type: ignore
 
 app = modal.App("math-misconception-qwen")
 
@@ -47,12 +47,12 @@ def train():
     from transformers import (
         AutoTokenizer,
         AutoModelForSequenceClassification,
-        TrainingArguments,
-        Trainer,
-        DataCollatorWithPadding,
+        TrainingArguments, #type: ignore
+        Trainer, #type: ignore
+        DataCollatorWithPadding, #type: ignore
     )
 
-    from peft import (
+    from peft import ( #type: ignore
         LoraConfig,
         get_peft_model,
         prepare_model_for_kbit_training,
@@ -75,10 +75,10 @@ def train():
         token=HF_TOKEN
     )
 
-    train = ds["train"].to_pandas()
-    train = train.head(500)
+    train = ds["train"].to_pandas() #type: ignore
+    train = train.head(500) #type: ignore
 
-    train.Misconception = train.Misconception.fillna("NA")
+    train.Misconception = train.Misconception.fillna("NA") #type: ignore
 
     train["target"] = (
         train.Category
@@ -88,7 +88,7 @@ def train():
 
     le = LabelEncoder()
 
-    train["label"] = le.fit_transform(
+    train["label"] = le.fit_transform( #type: ignore
         train["target"]
     )
 
@@ -131,7 +131,7 @@ def train():
         how="left",
     )
 
-    train.is_correct = (
+    train.is_correct = ( #type: ignore
         train.is_correct.fillna(0)
     )
 
